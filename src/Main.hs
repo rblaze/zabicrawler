@@ -53,55 +53,22 @@ worker :: Manager -> FetchContext -> FilePath -> IO ()
 worker manager context baseOutputDir = do
     topUrl <- getFirstUrl
     whenJust topUrl $ \url -> do
-        handle
-            (\e -> do
+        moreUrls <- catch (getAndParse url) $
+            \e -> do
                 putStrLn $ url ++ " " ++ show (e :: SomeException)
-                atomically $ modifyTVar (activeFetchers context) (\n -> n - 1)
-            )
-            (do
-                request <- parseRequest url
-                moreUrls <- withResponseHistory request manager $ \histResponse -> do
-                    let response = hrFinalResponse histResponse
-                    let finalUri = getUri $ hrFinalRequest histResponse
-                    let baseUri = getUri request
-                    let status = responseStatus response
-                    let contentType = responseContentType response
-                    putStrLn $ show baseUri ++ " -> " ++ show finalUri ++ " " ++ show status ++ " " ++ show contentType
+                return []
 
-                    if fromSameHost baseUri finalUri && statusIsSuccessful status && isText response
-                        then do
-                            let relativePath = uriToPath finalUri
-                            let outputPath = baseOutputDir </> relativePath
-                            let tempPath = outputPath ++ "#part"
+        atomically $ do
+            v <- readTVar (visited context)
+            forM_ moreUrls $ \nextUrl ->
+                when (nextUrl `S.notMember` v) $
+                    writeTQueue (urlQueue context) nextUrl
+            let vnext = foldr S.insert v moreUrls
+            writeTVar (visited context) vnext
+            modifyTVar (activeFetchers context) (\n -> n - 1)
 
-                            createDirectoryIfMissing True $ takeDirectory outputPath
-                            withFile tempPath WriteMode $ \ h -> do
-                                let loop = do
-                                        part <- brRead $ responseBody response
-                                        when (not $ BS8.null part) $ do
-                                            BS8.hPut h part
-                                            loop
-                                loop
-                            renameFile tempPath outputPath
-
-                            if isHtml response
-                                then mapMaybe (fixLink finalUri) . getLinks <$> BL.readFile outputPath
-                                else return []
-                        else return []
-
-                atomically $ do
-                    v <- readTVar (visited context)
-                    forM_ moreUrls $ \ nextUrl ->
-                        when (nextUrl `S.notMember` v) $
-                            writeTQueue (urlQueue context) nextUrl
-                    let vnext = foldr S.insert v moreUrls
-                    writeTVar (visited context) vnext
-                    modifyTVar (activeFetchers context) (\n -> n - 1)
-            )
         worker manager context baseOutputDir
     where
-    whenJust Nothing _ = return ()
-    whenJust (Just a) f = f a
     getFirstUrl = atomically $ do
         topUrl <- tryReadTQueue $ urlQueue context
         case topUrl of
@@ -110,6 +77,38 @@ worker manager context baseOutputDir = do
                 when (nActive /= 0) retry
             _ -> modifyTVar (activeFetchers context) (+ 1)
         return topUrl
+    getAndParse url = do
+        request <- parseRequest url
+        withResponseHistory request manager $ \histResponse -> do
+            let response = hrFinalResponse histResponse
+            let finalUri = getUri $ hrFinalRequest histResponse
+            let baseUri = getUri request
+            let status = responseStatus response
+            let contentType = responseContentType response
+            putStrLn $ show baseUri ++ " -> " ++ show finalUri ++ " " ++ show status ++ " " ++ show contentType
+
+            if statusIsSuccessful status && fromSameHost baseUri finalUri && isText response
+                then do
+                    let relativePath = uriToPath finalUri
+                    let outputPath = baseOutputDir </> relativePath
+                    let tempPath = outputPath ++ "#part"
+
+                    createDirectoryIfMissing True $ takeDirectory outputPath
+                    withFile tempPath WriteMode $ \h -> do
+                        let loop = do
+                                part <- brRead $ responseBody response
+                                when (not $ BS8.null part) $ do
+                                    BS8.hPut h part
+                                    loop
+                        loop
+                    renameFile tempPath outputPath
+
+                    if isHtml response
+                        then mapMaybe (fixLink finalUri) . getLinks <$> BL.readFile outputPath
+                        else return []
+                else return []
+    whenJust Nothing _ = return ()
+    whenJust (Just a) f = f a
     responseContentType = lookup hContentType . responseHeaders
     getLinks body =
         let tags = parseTagsOptions parseOptionsFast body
