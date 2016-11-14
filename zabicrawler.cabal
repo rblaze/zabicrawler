@@ -1,0 +1,28 @@
+name:                zabicrawler
+version:             0.1.0.0
+synopsis:            Simple project template from stack
+description:         Please see README.md
+homepage:            https://github.com/rblaze/zabicrawler#readme
+license:             BSD3
+license-file:        LICENSE
+author:              Andrey Sverdlichenko
+maintainer:          blaze@ruddy.ru
+copyright:           2016 Andrey Sverdlichenko
+category:            Net
+build-type:          Simple
+cabal-version:       >=1.10
+
+executable zabicrawler
+  hs-source-dirs:      src
+  main-is:             Main.hs
+  default-language:    Haskell2010
+  ghc-options:         -W -Wall
+  build-depends:       base >= 4.7 && < 5,
+                       bytestring,
+                       containers,
+                       http-client,
+                       http-client-tls,
+                       http-types,
+                       network-uri,
+                       stm,
+                       tagsoup
