@@ -10,7 +10,10 @@ import Network.HTTP.Client
 import Network.HTTP.Client.TLS
 import Network.HTTP.Types
 import Network.URI
+import System.Directory
 import System.Environment
+import System.FilePath
+import System.IO
 import Text.HTML.TagSoup
 import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy as BL
@@ -27,9 +30,9 @@ main = do
     args <- getArgs
     case args of
         [what, whereTo] -> fetch what whereTo
-        _ -> putStrLn "usage: zabicrawler http://what.to/download where_to_put"
+        _ -> putStrLn "usage: zabicrawler http://what.to.download where_to_put"
 
-fetch :: String -> String -> IO ()
+fetch :: String -> FilePath -> IO ()
 fetch urlRoot baseOutputDir = do
     manager <- newManager tlsManagerSettings
     context <- atomically $ do
@@ -39,20 +42,20 @@ fetch urlRoot baseOutputDir = do
                 v <- newTVar $ S.singleton urlRoot
                 return FetchContext { urlQueue = q, activeFetchers = n, visited = v }
 
-    replicateM_ 20 $ forkIO $ worker manager context
+    replicateM_ 20 $ forkIO $ worker manager context baseOutputDir
 
     atomically $ do
         queueEmpty <- isEmptyTQueue $ urlQueue context
         nActive <- readTVar $ activeFetchers context
         unless (queueEmpty && nActive == 0) retry
 
-worker :: Manager -> FetchContext -> IO ()
-worker manager context = do
+worker :: Manager -> FetchContext -> FilePath -> IO ()
+worker manager context baseOutputDir = do
     topUrl <- getFirstUrl
     whenJust topUrl $ \url -> do
         handle
             (\e -> do
-                print (e :: SomeException)
+                putStrLn $ url ++ " " ++ show (e :: SomeException)
                 atomically $ modifyTVar (activeFetchers context) (\n -> n - 1)
             )
             (do
@@ -65,12 +68,24 @@ worker manager context = do
                     let contentType = responseContentType response
                     putStrLn $ show baseUri ++ " -> " ++ show finalUri ++ " " ++ show status ++ " " ++ show contentType
 
-                    if fromSameHost baseUri finalUri && statusIsSuccessful status &&
-                            isText response
+                    if fromSameHost baseUri finalUri && statusIsSuccessful status && isText response
                         then do
-                            body <- BL.fromChunks <$> brConsume (responseBody response)
+                            let relativePath = uriToPath finalUri
+                            let outputPath = baseOutputDir </> relativePath
+                            let tempPath = outputPath ++ "#part"
+
+                            createDirectoryIfMissing True $ takeDirectory outputPath
+                            withFile tempPath WriteMode $ \ h -> do
+                                let loop = do
+                                        part <- brRead $ responseBody response
+                                        when (not $ BS8.null part) $ do
+                                            BS8.hPut h part
+                                            loop
+                                loop
+                            renameFile tempPath outputPath
+
                             if isHtml response
-                                then return $ mapMaybe (fixLink finalUri) $ getLinks body
+                                then mapMaybe (fixLink finalUri) . getLinks <$> BL.readFile outputPath
                                 else return []
                         else return []
 
@@ -83,7 +98,7 @@ worker manager context = do
                     writeTVar (visited context) vnext
                     modifyTVar (activeFetchers context) (\n -> n - 1)
             )
-        worker manager context
+        worker manager context baseOutputDir
     where
     whenJust Nothing _ = return ()
     whenJust (Just a) f = f a
@@ -111,3 +126,7 @@ worker manager context = do
     fromSameHost uri1 uri2 = uriScheme uri1 == uriScheme uri2 && uriAuthority uri1 == uriAuthority uri2
     isText response = (BS8.isPrefixOf "text/" <$> responseContentType response) == Just True
     isHtml response = (BS8.isPrefixOf "text/html" <$> responseContentType response) == Just True
+    uriToPath uri =
+        let base = uriPath uri </> uriQuery uri
+            expanded = if last base == '/' then base ++ "index.html" else base
+         in tail expanded
