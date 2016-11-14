@@ -60,10 +60,13 @@ worker manager context baseOutputDir = do
 
         atomically $ do
             v <- readTVar (visited context)
-            forM_ moreUrls $ \nextUrl ->
-                when (nextUrl `S.notMember` v) $
-                    writeTQueue (urlQueue context) nextUrl
-            let vnext = foldr S.insert v moreUrls
+            vnext <- foldM (\vis nextUrl ->
+                    if nextUrl `S.notMember` vis
+                        then do
+                            writeTQueue (urlQueue context) nextUrl
+                            return $ nextUrl `S.insert` vis
+                        else return vis
+                ) v moreUrls
             writeTVar (visited context) vnext
             modifyTVar (activeFetchers context) (\n -> n - 1)
 
