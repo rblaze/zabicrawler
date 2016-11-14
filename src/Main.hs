@@ -6,6 +6,7 @@ import Control.Concurrent.STM
 import Control.Exception
 import Control.Monad
 import Data.Maybe
+import Data.Sequence (Seq, (|>), ViewL(..))
 import Network.HTTP.Client
 import Network.HTTP.Client.TLS
 import Network.HTTP.Types
@@ -17,10 +18,11 @@ import System.IO
 import Text.HTML.TagSoup
 import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy as BL
+import qualified Data.Sequence as Seq
 import qualified Data.Set as S
 
 data FetchContext = FetchContext
-    { urlQueue :: TQueue String
+    { urlQueue :: TVar (Seq String)
     , activeFetchers :: TVar Int
     , visited :: TVar (S.Set String)
     }
@@ -36,8 +38,7 @@ fetch :: String -> FilePath -> IO ()
 fetch urlRoot baseOutputDir = do
     manager <- newManager tlsManagerSettings
     context <- atomically $ do
-                q <- newTQueue
-                writeTQueue q urlRoot
+                q <- newTVar $ Seq.singleton urlRoot
                 n <- newTVar 0
                 v <- newTVar $ S.singleton urlRoot
                 return FetchContext { urlQueue = q, activeFetchers = n, visited = v }
@@ -45,7 +46,7 @@ fetch urlRoot baseOutputDir = do
     replicateM_ 20 $ forkIO $ worker manager context baseOutputDir
 
     atomically $ do
-        queueEmpty <- isEmptyTQueue $ urlQueue context
+        queueEmpty <- Seq.null <$> readTVar (urlQueue context)
         nActive <- readTVar $ activeFetchers context
         unless (queueEmpty && nActive == 0) retry
 
@@ -63,7 +64,7 @@ worker manager context baseOutputDir = do
             vnext <- foldM (\vis nextUrl ->
                     if nextUrl `S.notMember` vis
                         then do
-                            writeTQueue (urlQueue context) nextUrl
+                            modifyTVar (urlQueue context) (|> nextUrl)
                             return $ nextUrl `S.insert` vis
                         else return vis
                 ) v moreUrls
@@ -73,13 +74,16 @@ worker manager context baseOutputDir = do
         worker manager context baseOutputDir
     where
     getFirstUrl = atomically $ do
-        topUrl <- tryReadTQueue $ urlQueue context
-        case topUrl of
-            Nothing -> do
+        q <- readTVar $ urlQueue context
+        let qview = Seq.viewl q
+        case qview of
+            EmptyL -> do
                 nActive <- readTVar $ activeFetchers context
-                when (nActive /= 0) retry
-            _ -> modifyTVar (activeFetchers context) (+ 1)
-        return topUrl
+                if nActive /= 0 then retry else return Nothing
+            topUrl :< qnext -> do
+                writeTVar (urlQueue context) qnext
+                modifyTVar (activeFetchers context) (+ 1)
+                return $ Just topUrl
     getAndParse url = do
         request <- parseRequest url
         withResponseHistory request manager $ \histResponse -> do
@@ -100,7 +104,7 @@ worker manager context baseOutputDir = do
                     withFile tempPath WriteMode $ \h -> do
                         let loop = do
                                 part <- brRead $ responseBody response
-                                when (not $ BS8.null part) $ do
+                                unless (BS8.null part) $ do
                                     BS8.hPut h part
                                     loop
                         loop
